@@ -1,9 +1,9 @@
 # ESP-IDF Partition Table
 # Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,    0x4000,
-otadata,  data, ota,     0xd000,    0x2000,
-phy_init, data, phy,     0xf000,    0x1000,
-model,    data, spiffs,  0x10000,   0xF0000,  # 960KB（与16M版本一致）
-ota_0,    app,  ota_0,   0x100000,  10M,      # 扩大为10MB（32M总容量下可分配更多空间）
-ota_1,    app,  ota_1,   0xB00000,  10M,      # 与ota_0对称
-assets_A,  data, spiffs,  ,         8M,       # 剩余空间分配给assets_A（自动计算偏移）
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+phy_init, data, phy,     0xf000,  0x1000,
+model,    data, spiffs,  0x10000, 0xF0000,  # 960KB（与16M版本一致）  # 原行正确，保留
+ota_0,    app,  ota_0,   0x100000,0xA00000, # 10MB（十六进制0xA00000 = 10*1024*1024字节）
+ota_1,    app,  ota_1,   0xB00000,0xA00000, # 10MB（与ota_0对称，0xB00000+0xA00000=0x1500000）
+assets_A, data, spiffs,  0x1500000,0x800000, # 8MB（0x800000=8*1024*1024字节），手动指定偏移

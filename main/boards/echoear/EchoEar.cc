@@ -1,4 +1,4 @@
-// 休眠状态下跌落能触发吗。
+// 休眠状态下跌落？？
 
 #include "wifi_board.h"
 #include "codecs/box_audio_codec.h"

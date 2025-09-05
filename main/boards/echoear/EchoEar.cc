@@ -1,3 +1,5 @@
+// 休眠状态下跌落能触发吗。
+
 #include "wifi_board.h"
 #include "codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
@@ -24,14 +26,53 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
-#define TAG "EchoEar"
+// BMI270相关头文件和定义
+#include "bmi270.h"
+#include "bmi2_defs.h"
 
+// 宏定义与常量
+#define TAG "EchoEar"
+#define BMI270_TAG "BMI270"
 #define USE_LVGL_DEFAULT    0
 
+// BMI270配置
+#define BMI270_I2C_ADDR 0x68  // SA0接地
+#define BMI270_SDA_GPIO 1     // ICM_SDA复用GPIO1
+#define BMI270_SCL_GPIO 2     // ICM_SCL复用GPIO2
+
+// 运动检测参数（使用constexpr提高编译期计算效率）
+constexpr float SHAKE_THRESHOLD = 15.0f;       // 摇晃加速度阈值(g)
+constexpr float FALL_THRESHOLD = 0.3f;         // 跌落检测阈值(g)
+constexpr uint32_t FALL_DURATION = 500;        // 跌落持续时间(ms)
+constexpr uint32_t SHAKE_DURATION = 1000;      // 摇晃检测时间窗口(ms)
+constexpr uint8_t SHAKE_COUNT_THRESHOLD = 3;   // 检测窗口内摇晃次数阈值
+
+// 字体声明
 LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_awesome_20_4);
-temperature_sensor_handle_t temp_sensor = NULL;
-static const st77916_lcd_init_cmd_t vendor_specific_init_yysj[] = {
+
+// 全局设备句柄与变量
+static temperature_sensor_handle_t temp_sensor = NULL;
+static float tsens_value;
+
+// 硬件引脚配置（使用constexpr确保不可修改）
+constexpr gpio_num_t AUDIO_I2S_GPIO_DIN_DEFAULT = AUDIO_I2S_GPIO_DIN_1;
+constexpr gpio_num_t AUDIO_CODEC_PA_PIN_DEFAULT = AUDIO_CODEC_PA_PIN_1;
+constexpr gpio_num_t QSPI_PIN_NUM_LCD_RST_DEFAULT = QSPI_PIN_NUM_LCD_RST_1;
+constexpr gpio_num_t TOUCH_PAD2_DEFAULT = TOUCH_PAD2_1;
+constexpr gpio_num_t UART1_TX_DEFAULT = UART1_TX_1;
+constexpr gpio_num_t UART1_RX_DEFAULT = UART1_RX_1;
+
+// 动态引脚变量
+static gpio_num_t AUDIO_I2S_GPIO_DIN = AUDIO_I2S_GPIO_DIN_DEFAULT;
+static gpio_num_t AUDIO_CODEC_PA_PIN = AUDIO_CODEC_PA_PIN_DEFAULT;
+static gpio_num_t QSPI_PIN_NUM_LCD_RST = QSPI_PIN_NUM_LCD_RST_DEFAULT;
+static gpio_num_t TOUCH_PAD2 = TOUCH_PAD2_DEFAULT;
+static gpio_num_t UART1_TX = UART1_TX_DEFAULT;
+static gpio_num_t UART1_RX = UART1_RX_DEFAULT;
+
+// LCD初始化命令（使用constexpr数组）
+constexpr st77916_lcd_init_cmd_t vendor_specific_init_yysj[] = {
     {0xF0, (uint8_t []){0x28}, 1, 0},
     {0xF2, (uint8_t []){0x28}, 1, 0},
     {0x73, (uint8_t []){0xF0}, 1, 0},
@@ -217,39 +258,232 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_yysj[] = {
     {0x11, (uint8_t []){}, 0, 0},
     {0x00, (uint8_t []){}, 0, 120},
 };
-float tsens_value;
-gpio_num_t AUDIO_I2S_GPIO_DIN = AUDIO_I2S_GPIO_DIN_1;
-gpio_num_t AUDIO_CODEC_PA_PIN = AUDIO_CODEC_PA_PIN_1;
-gpio_num_t QSPI_PIN_NUM_LCD_RST = QSPI_PIN_NUM_LCD_RST_1;
-gpio_num_t TOUCH_PAD2 = TOUCH_PAD2_1;
-gpio_num_t UART1_TX = UART1_TX_1;
-gpio_num_t UART1_RX = UART1_RX_1;
 
+// BMI270设备和数据结构（使用std::unique_ptr管理）
+static struct bmi2_dev bmi270_dev;
+static struct bmi2_sens_data bmi2_sensor_data;
+static SemaphoreHandle_t bmi270_mutex = nullptr;
+static bool is_falling = false;
+static int shake_count = 0;
+static TickType_t last_shake_time = 0;
+
+// BMI270 I2C读写函数（优化设备添加/移除逻辑）
+static int8_t bmi270_i2c_write(uint8_t reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr) {
+    if (!intf_ptr || !data) return BMI2_E_NULL_PTR;
+    
+    i2c_master_bus_handle_t i2c_bus = static_cast<i2c_master_bus_handle_t>(intf_ptr);
+    i2c_master_dev_handle_t dev_handle = nullptr;
+    
+    i2c_master_dev_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BMI270_I2C_ADDR,
+        .scl_speed_hz = 400000,
+    };
+    
+    esp_err_t ret = i2c_master_bus_add_device(i2c_bus, &dev_cfg, &dev_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(BMI270_TAG, "Failed to add I2C device: %s", esp_err_to_name(ret));
+        return BMI2_E_COMM_FAIL;
+    }
+    
+    ret = i2c_master_transmit(dev_handle, &reg_addr, 1, data, len, pdMS_TO_TICKS(100));
+    i2c_master_bus_remove_device(dev_handle);
+    
+    return (ret == ESP_OK) ? BMI2_OK : BMI2_E_COMM_FAIL;
+}
+
+static int8_t bmi270_i2c_read(uint8_t reg_addr, uint8_t *data, uint32_t len, void *intf_ptr) {
+    if (!intf_ptr || !data) return BMI2_E_NULL_PTR;
+    
+    i2c_master_bus_handle_t i2c_bus = static_cast<i2c_master_bus_handle_t>(intf_ptr);
+    i2c_master_dev_handle_t dev_handle = nullptr;
+    
+    i2c_master_dev_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BMI270_I2C_ADDR,
+        .scl_speed_hz = 400000,
+    };
+    
+    esp_err_t ret = i2c_master_bus_add_device(i2c_bus, &dev_cfg, &dev_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(BMI270_TAG, "Failed to add I2C device: %s", esp_err_to_name(ret));
+        return BMI2_E_COMM_FAIL;
+    }
+    
+    ret = i2c_master_transmit_receive(dev_handle, &reg_addr, 1, data, len, pdMS_TO_TICKS(100));
+    i2c_master_bus_remove_device(dev_handle);
+    
+    return (ret == ESP_OK) ? BMI2_OK : BMI2_E_COMM_FAIL;
+}
+
+// BMI270初始化函数（增加错误处理和配置检查）
+static int8_t bmi270_init(i2c_master_bus_handle_t i2c_bus) {
+    if (!i2c_bus) {
+        ESP_LOGE(BMI270_TAG, "Invalid I2C bus handle");
+        return BMI2_E_NULL_PTR;
+    }
+
+    int8_t rslt;
+    
+    // 初始化BMI270设备结构体
+    bmi270_dev.intf = BMI2_I2C_INTF;
+    bmi270_dev.read = bmi270_i2c_read;
+    bmi270_dev.write = bmi270_i2c_write;
+    bmi270_dev.intf_ptr = i2c_bus;
+    bmi270_dev.delay_us = [](uint32_t period, void *intf_ptr) {
+        vTaskDelay(pdMS_TO_TICKS(period / 1000));
+    };
+    bmi270_dev.config_file_ptr = nullptr;
+    
+    // 初始化传感器
+    rslt = bmi270_init(&bmi270_dev);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(BMI270_TAG, "Failed to initialize BMI270: %d", rslt);
+        return rslt;
+    }
+    
+    // 配置加速度计
+    struct bmi2_sens_config config;
+    config.type = BMI2_ACCEL;
+    config.acc.odr = BMI2_ACC_ODR_100HZ;
+    config.acc.range = BMI2_ACC_RANGE_2G;
+    config.acc.bw = BMI2_ACC_BW_NORMAL;
+    
+    rslt = bmi270_set_sensor_config(&config, 1, &bmi270_dev);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(BMI270_TAG, "Failed to configure accelerometer: %d", rslt);
+        return rslt;
+    }
+    
+    // 启用加速度计
+    rslt = bmi270_sensor_enable(BMI2_ACCEL, &bmi270_dev);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(BMI270_TAG, "Failed to enable accelerometer: %d", rslt);
+        return rslt;
+    }
+    
+    ESP_LOGI(BMI270_TAG, "BMI270 initialized successfully");
+    return BMI2_OK;
+}
+
+// 运动检测任务（优化逻辑和资源锁定）
+static void motion_detection_task(void *arg) {
+    auto& app = Application::GetInstance();
+    auto& board = static_cast<EspS3Cat&>(Board::GetInstance());
+    TickType_t last_fall_time = 0;
+    
+    if (!bmi270_mutex) {
+        ESP_LOGE(BMI270_TAG, "BMI270 mutex not initialized");
+        vTaskDelete(nullptr);
+        return;
+    }
+    
+    while (true) {
+        if (xSemaphoreTake(bmi270_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            // 读取加速度数据
+            int8_t rslt = bmi270_get_sensor_data(&bmi2_sensor_data, &bmi270_dev);
+            xSemaphoreGive(bmi270_mutex);
+            
+            if (rslt == BMI2_OK) {
+                // 计算加速度大小 (转换为g)
+                float accel_x = bmi2_sensor_data.acc.x / 1024.0f;
+                float accel_y = bmi2_sensor_data.acc.y / 1024.0f;
+                float accel_z = bmi2_sensor_data.acc.z / 1024.0f;
+                float accel_mag = sqrtf(accel_x*accel_x + accel_y*accel_y + accel_z*accel_z);
+                
+                // 跌落检测
+                if (accel_mag < FALL_THRESHOLD) {
+                    if (!is_falling) {
+                        last_fall_time = xTaskGetTickCount();
+                        is_falling = true;
+                    } else if (xTaskGetTickCount() - last_fall_time > pdMS_TO_TICKS(FALL_DURATION)) {
+                        ESP_LOGI(BMI270_TAG, "Fall detected! Acceleration: %.2fg", accel_mag);
+                        
+                        // 发送消息给大模型
+                        app.SendUserMessage("你被摔倒在地");
+                        // 显示相应表情
+                        if (board.GetDisplay()) {
+                            board.GetDisplay()->SetEmotion("surprised");
+                        }
+                        
+                        is_falling = false;
+                        vTaskDelay(pdMS_TO_TICKS(2000)); // 防止重复检测
+                    }
+                } else {
+                    is_falling = false;
+                }
+                
+                // 摇晃检测
+                if (accel_mag > SHAKE_THRESHOLD) {
+                    TickType_t current_time = xTaskGetTickCount();
+                    
+                    // 检查是否在时间窗口内
+                    if (current_time - last_shake_time < pdMS_TO_TICKS(SHAKE_DURATION)) {
+                        shake_count++;
+                        
+                        // 达到摇晃次数阈值
+                        if (shake_count >= SHAKE_COUNT_THRESHOLD) {
+                            ESP_LOGI(BMI270_TAG, "Shake detected! Acceleration: %.2fg", accel_mag);
+                            
+                            // 发送消息给大模型
+                            app.SendUserMessage("你被狠狠地摇晃了");
+                            // 显示相应表情
+                            if (board.GetDisplay()) {
+                                board.GetDisplay()->SetEmotion("dizzy");
+                            }
+                            
+                            shake_count = 0;
+                            vTaskDelay(pdMS_TO_TICKS(2000)); // 防止重复检测
+                        }
+                    } else {
+                        // 重置时间窗口和计数
+                        last_shake_time = current_time;
+                        shake_count = 1;
+                    }
+                }
+            } else {
+                ESP_LOGE(BMI270_TAG, "Failed to read sensor data: %d", rslt);
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50)); // 20Hz采样率
+    }
+}
+
+// 充电管理类（使用智能指针和RAII）
 class Charge : public I2cDevice {
 public:
-    Charge(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
-    {
+    Charge(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr) {
         read_buffer_ = new uint8_t[8];
     }
-    ~Charge()
-    {
+    
+    ~Charge() override {
         delete[] read_buffer_;
     }
-    void Printcharge()
-    {
+    
+    void Printcharge() {
         ReadRegs(0x08, read_buffer_, 2);
         ReadRegs(0x0c, read_buffer_ + 2, 2);
-        ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
+        
+        if (temp_sensor) {
+            ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
+        }
 
         int16_t voltage = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
         int16_t current = static_cast<int16_t>(read_buffer_[3] << 8 | read_buffer_[2]);
         
-        // Use the variables to avoid warnings (can be removed if actual implementation uses them)
+        // 可在此处添加电压电流处理逻辑
         (void)voltage;
         (void)current;
     }
-    static void TaskFunction(void *pvParameters)
-    {
+    
+    static void TaskFunction(void *pvParameters) {
+        if (!pvParameters) {
+            ESP_LOGE(TAG, "Invalid parameter for Charge task");
+            vTaskDelete(nullptr);
+            return;
+        }
+        
         Charge* charge = static_cast<Charge*>(pvParameters);
         while (true) {
             charge->Printcharge();
@@ -261,6 +495,7 @@ private:
     uint8_t* read_buffer_ = nullptr;
 };
 
+// 触摸管理类（优化事件处理和资源管理）
 class Cst816s : public I2cDevice {
 public:
     struct TouchPoint_t {
@@ -276,130 +511,100 @@ public:
         TOUCH_HOLD
     };
 
-    Cst816s(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
-    {
+    Cst816s(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr) {
         read_buffer_ = new uint8_t[6];
         was_touched_ = false;
         press_count_ = 0;
 
-        // Create touch interrupt semaphore
+        // 创建触摸中断信号量
         touch_isr_mux_ = xSemaphoreCreateBinary();
-        if (touch_isr_mux_ == NULL) {
+        if (!touch_isr_mux_) {
             ESP_LOGE("EchoEar", "Failed to create touch semaphore");
         }
     }
 
-    ~Cst816s()
-    {
+    ~Cst816s() override {
         delete[] read_buffer_;
-
-        // Delete semaphore if it exists
-        if (touch_isr_mux_ != NULL) {
+        if (touch_isr_mux_) {
             vSemaphoreDelete(touch_isr_mux_);
-            touch_isr_mux_ = NULL;
         }
     }
 
-    void UpdateTouchPoint()
-    {
+    void NotifyTouchEvent() {
+        if (touch_isr_mux_) {
+            xSemaphoreGiveFromISR(touch_isr_mux_, NULL);
+        }
+    }
+
+    bool WaitForTouchEvent(TickType_t timeout = portMAX_DELAY) {
+        return touch_isr_mux_ && xSemaphoreTake(touch_isr_mux_, timeout) == pdTRUE;
+    }
+
+    void UpdateTouchPoint() {
         ReadRegs(0x02, read_buffer_, 6);
-        tp_.num = read_buffer_[0] & 0x0F;
-        tp_.x = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
-        tp_.y = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
+        
+        point_.num = read_buffer_[0] & 0x0F;
+        if (point_.num == 0) {
+            point_.x = -1;
+            point_.y = -1;
+            return;
+        }
+
+        point_.x = ((read_buffer_[2] & 0x0F) << 8) | read_buffer_[3];
+        point_.y = ((read_buffer_[4] & 0x0F) << 8) | read_buffer_[5];
     }
 
-    const TouchPoint_t &GetTouchPoint()
-    {
-        return tp_;
-    }
-
-    TouchEvent CheckTouchEvent()
-    {
-        bool is_touched = (tp_.num > 0);
+    TouchEvent CheckTouchEvent() {
+        bool is_touched = (point_.num > 0);
         TouchEvent event = TOUCH_NONE;
 
-        if (is_touched && !was_touched_) {
-            // Press event (transition from not touched to touched)
-            press_count_++;
-            event = TOUCH_PRESS;
-            ESP_LOGI("EchoEar", "TOUCH PRESS - count: %d, x: %d, y: %d", press_count_, tp_.x, tp_.y);
-        } else if (!is_touched && was_touched_) {
-            // Release event (transition from touched to not touched)
+        if (is_touched) {
+            if (!was_touched_) {
+                event = TOUCH_PRESS;
+                press_count_ = 0;
+            } else {
+                press_count_++;
+                event = (press_count_ > 20) ? TOUCH_HOLD : TOUCH_NONE;
+            }
+        } else if (was_touched_) {
             event = TOUCH_RELEASE;
-            ESP_LOGI("EchoEar", "TOUCH RELEASE - total presses: %d", press_count_);
-        } else if (is_touched && was_touched_) {
-            // Continuous touch (hold)
-            event = TOUCH_HOLD;
-            ESP_LOGD("EchoEar", "TOUCH HOLD - x: %d, y: %d", tp_.x, tp_.y);
         }
 
-        // Update previous state
         was_touched_ = is_touched;
         return event;
     }
 
-    int GetPressCount() const
-    {
-        return press_count_;
-    }
-
-    void ResetPressCount()
-    {
-        press_count_ = 0;
-    }
-
-    // Semaphore management methods
-    SemaphoreHandle_t GetTouchSemaphore()
-    {
-        return touch_isr_mux_;
-    }
-
-    bool WaitForTouchEvent(TickType_t timeout = portMAX_DELAY)
-    {
-        if (touch_isr_mux_ != NULL) {
-            return xSemaphoreTake(touch_isr_mux_, timeout) == pdTRUE;
-        }
-        return false;
-    }
-
-    void NotifyTouchEvent()
-    {
-        if (touch_isr_mux_ != NULL) {
-            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            xSemaphoreGiveFromISR(touch_isr_mux_, &xHigherPriorityTaskWoken);
-            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-        }
+    TouchPoint_t GetTouchPoint() const {
+        return point_;
     }
 
 private:
-    uint8_t* read_buffer_ = nullptr;
-    TouchPoint_t tp_;
-
-    // Touch state tracking
+    uint8_t* read_buffer_;
+    TouchPoint_t point_;
+    SemaphoreHandle_t touch_isr_mux_;
     bool was_touched_;
     int press_count_;
-
-    // Touch interrupt semaphore
-    SemaphoreHandle_t touch_isr_mux_;
 };
 
+// 主板类（优化初始化流程和资源管理）
 class EspS3Cat : public WifiBoard {
 private:
-    i2c_master_bus_handle_t i2c_bus_;
-    Cst816s* cst816s_;
-    Charge* charge_;
+    i2c_master_bus_handle_t i2c_bus_ = nullptr;
+    i2c_master_bus_handle_t bmi270_i2c_bus_ = nullptr;
+    std::unique_ptr<Cst816s> cst816s_;
+    std::unique_ptr<Charge> charge_;
     Button boot_button_;
 #if USE_LVGL_DEFAULT
-    LcdDisplay* display_;
+    std::unique_ptr<LcdDisplay> display_;
 #else
-    anim::EmoteDisplay* display_ = nullptr;
+    std::unique_ptr<anim::EmoteDisplay> display_;
 #endif
-    PwmBacklight* backlight_ = nullptr;
-    esp_timer_handle_t touchpad_timer_;
-    esp_lcd_touch_handle_t tp;   // LCD touch handle
+    std::unique_ptr<PwmBacklight> backlight_;
+    esp_lcd_touch_handle_t tp = nullptr;   // LCD触摸句柄
 
-    void InitializeI2c()
-    {
+    // 初始化I2C总线
+    void InitializeI2c() {
+        // 初始化主I2C总线
         i2c_master_bus_config_t i2c_bus_cfg = {
             .i2c_port = I2C_NUM_0,
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
@@ -414,19 +619,42 @@ private:
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
 
+        // 初始化BMI270专用I2C总线 (GPIO1和GPIO2)
+        i2c_bus_cfg.i2c_port = I2C_NUM_1;  // 使用不同的I2C端口
+        i2c_bus_cfg.sda_io_num = BMI270_SDA_GPIO;
+        i2c_bus_cfg.scl_io_num = BMI270_SCL_GPIO;
+        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &bmi270_i2c_bus_));
+
+        // 初始化温度传感器
         temperature_sensor_config_t temp_sensor_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
         ESP_ERROR_CHECK(temperature_sensor_install(&temp_sensor_config, &temp_sensor));
         ESP_ERROR_CHECK(temperature_sensor_enable(temp_sensor));
 
-    }
-    uint8_t DetectPcbVersion()
-    {
-        esp_err_t ret = i2c_master_probe(i2c_bus_, 0x18, 100);
-        uint8_t pcb_verison = 0;
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "PCB verison V1.0");
-            pcb_verison = 0;
+        // 初始化BMI270传感器和互斥锁
+        bmi270_mutex = xSemaphoreCreateMutex();
+        if (bmi270_mutex && bmi270_init(bmi270_i2c_bus_) == BMI2_OK) {
+            // 创建运动检测任务
+            xTaskCreatePinnedToCore(motion_detection_task, "motion_detection", 4096, 
+                                   nullptr, 5, nullptr, 1);
         } else {
+            ESP_LOGE(BMI270_TAG, "Failed to initialize BMI270, motion detection disabled");
+            if (bmi270_mutex) {
+                vSemaphoreDelete(bmi270_mutex);
+                bmi270_mutex = nullptr;
+            }
+        }
+    }
+
+    // 检测PCB版本
+    uint8_t DetectPcbVersion() {
+        esp_err_t ret = i2c_master_probe(i2c_bus_, 0x18, 100);
+        uint8_t pcb_version = 0;
+        
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "PCB version V1.0");
+            pcb_version = 0;
+        } else {
+            // 配置GPIO48为输出
             gpio_config_t gpio_conf = {
                 .pin_bit_mask = (1ULL << GPIO_NUM_48),
                 .mode = GPIO_MODE_OUTPUT,
@@ -437,10 +665,13 @@ private:
             ESP_ERROR_CHECK(gpio_config(&gpio_conf));
             ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_48, 1));
             vTaskDelay(pdMS_TO_TICKS(100));
+            
+            // 再次探测
             ret = i2c_master_probe(i2c_bus_, 0x18, 100);
             if (ret == ESP_OK) {
-                ESP_LOGI(TAG, "PCB verison V1.2");
-                pcb_verison = 1;
+                ESP_LOGI(TAG, "PCB version V1.2");
+                pcb_version = 1;
+                // 更新引脚配置
                 AUDIO_I2S_GPIO_DIN = AUDIO_I2S_GPIO_DIN_2;
                 AUDIO_CODEC_PA_PIN = AUDIO_CODEC_PA_PIN_2;
                 QSPI_PIN_NUM_LCD_RST = QSPI_PIN_NUM_LCD_RST_2;
@@ -449,33 +680,32 @@ private:
                 UART1_RX = UART1_RX_2;
             } else {
                 ESP_LOGE(TAG, "PCB version detection error");
-
             }
         }
-        return pcb_verison;
+        return pcb_version;
     }
 
-    static void touch_isr_callback(void* arg)
-    {
+    // 触摸中断回调
+    static void touch_isr_callback(void* arg) {
         Cst816s* touchpad = static_cast<Cst816s*>(arg);
-        if (touchpad != nullptr) {
+        if (touchpad) {
             touchpad->NotifyTouchEvent();
         }
     }
 
-    static void touch_event_task(void* arg)
-    {
+    // 触摸事件处理任务
+    static void touch_event_task(void* arg) {
         Cst816s* touchpad = static_cast<Cst816s*>(arg);
-        if (touchpad == nullptr) {
+        if (!touchpad) {
             ESP_LOGE(TAG, "Invalid touchpad pointer in touch_event_task");
-            vTaskDelete(NULL);
+            vTaskDelete(nullptr);
             return;
         }
 
         while (true) {
             if (touchpad->WaitForTouchEvent()) {
                 auto &app = Application::GetInstance();
-                auto &board = (EspS3Cat &)Board::GetInstance();
+                auto &board = static_cast<EspS3Cat&>(Board::GetInstance());
 
                 ESP_LOGI(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
                 touchpad->UpdateTouchPoint();
@@ -483,7 +713,7 @@ private:
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
                     if (app.GetDeviceState() == kDeviceStateStarting &&
-                            !WifiStation::GetInstance().IsConnected()) {
+                        !WifiStation::GetInstance().IsConnected()) {
                         board.ResetWifiConfiguration();
                     } else {
                         app.ToggleChatState();
@@ -493,124 +723,168 @@ private:
         }
     }
 
-    void InitializeCharge()
-    {
-        charge_ = new Charge(i2c_bus_, 0x55);
-        xTaskCreatePinnedToCore(Charge::TaskFunction, "batterydecTask", 3 * 1024, charge_, 6, NULL, 0);
+    // 初始化充电管理
+    void InitializeCharge() {
+        charge_ = std::make_unique<Charge>(i2c_bus_, 0x55);
+        xTaskCreatePinnedToCore(Charge::TaskFunction, "batterydecTask", 3 * 1024, 
+                               charge_.get(), 6, nullptr, 0);
     }
 
-    void InitializeCst816sTouchPad()
-    {
-        cst816s_ = new Cst816s(i2c_bus_, 0x15);
+    // 初始化触摸板
+    void InitializeCst816sTouchPad() {
+        cst816s_ = std::make_unique<Cst816s>(i2c_bus_, 0x15);
 
-        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5, NULL, 1);
+        // 创建触摸任务
+        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, 
+                               cst816s_.get(), 5, nullptr, 1);
 
+        // 配置触摸中断引脚
         const gpio_config_t int_gpio_config = {
             .pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
             .mode = GPIO_MODE_INPUT,
-            // .intr_type = GPIO_INTR_NEGEDGE
             .intr_type = GPIO_INTR_ANYEDGE
         };
-        gpio_config(&int_gpio_config);
-        gpio_install_isr_service(0);
-        gpio_intr_enable(TP_PIN_NUM_INT);
-        gpio_isr_handler_add(TP_PIN_NUM_INT, EspS3Cat::touch_isr_callback, cst816s_);
+        ESP_ERROR_CHECK(gpio_config(&int_gpio_config));
+        ESP_ERROR_CHECK(gpio_install_isr_service(0));
+        ESP_ERROR_CHECK(gpio_intr_enable(TP_PIN_NUM_INT));
+        ESP_ERROR_CHECK(gpio_isr_handler_add(TP_PIN_NUM_INT, 
+                                           EspS3Cat::touch_isr_callback, 
+                                           cst816s_.get()));
     }
 
-    void InitializeSpi()
-    {
-        const spi_bus_config_t bus_config = TAIJIPI_ST77916_PANEL_BUS_QSPI_CONFIG(QSPI_PIN_NUM_LCD_PCLK,
-                                                                                  QSPI_PIN_NUM_LCD_DATA0,
-                                                                                  QSPI_PIN_NUM_LCD_DATA1,
-                                                                                  QSPI_PIN_NUM_LCD_DATA2,
-                                                                                  QSPI_PIN_NUM_LCD_DATA3,
-                                                                                  QSPI_LCD_H_RES * 80 * sizeof(uint16_t));
+    // 初始化SPI总线
+    void InitializeSpi() {
+        const spi_bus_config_t bus_config = TAIJIPI_ST77916_PANEL_BUS_QSPI_CONFIG(
+            QSPI_PIN_NUM_LCD_PCLK,
+            QSPI_PIN_NUM_LCD_DATA0,
+            QSPI_PIN_NUM_LCD_DATA1,
+            QSPI_PIN_NUM_LCD_DATA2,
+            QSPI_PIN_NUM_LCD_DATA3,
+            QSPI_LCD_H_RES * 80 * sizeof(uint16_t)
+        );
         ESP_ERROR_CHECK(spi_bus_initialize(QSPI_LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
     }
 
-    void Initializest77916Display(uint8_t pcb_verison)
-    {
-
+    // 初始化显示屏
+    void Initializest77916Display(uint8_t pcb_version) {
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
 
-        const esp_lcd_panel_io_spi_config_t io_config = ST77916_PANEL_IO_QSPI_CONFIG(QSPI_PIN_NUM_LCD_CS, NULL, NULL);
-        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)QSPI_LCD_HOST, &io_config, &panel_io));
+        const esp_lcd_panel_io_spi_config_t io_config = ST77916_PANEL_IO_QSPI_CONFIG(
+            QSPI_PIN_NUM_LCD_CS, nullptr, nullptr
+        );
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
+            (esp_lcd_spi_bus_handle_t)QSPI_LCD_HOST, 
+            &io_config, 
+            &panel_io
+        ));
+
         st77916_vendor_config_t vendor_config = {
             .init_cmds = vendor_specific_init_yysj,
             .init_cmds_size = sizeof(vendor_specific_init_yysj) / sizeof(st77916_lcd_init_cmd_t),
-            .flags = {
-                .use_qspi_interface = 1,
-            },
         };
-        const esp_lcd_panel_dev_config_t panel_config = {
+
+        esp_lcd_panel_dev_config_t panel_config = {
             .reset_gpio_num = QSPI_PIN_NUM_LCD_RST,
-            .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-            .bits_per_pixel = QSPI_LCD_BIT_PER_PIXEL,
-            .flags = {
-                .reset_active_high = pcb_verison,
-            },
+            .rgb_endian = LCD_RGB_ENDIAN_BGR,
+            .bits_per_pixel = 16,
             .vendor_config = &vendor_config,
         };
         ESP_ERROR_CHECK(esp_lcd_new_panel_st77916(panel_io, &panel_config, &panel));
 
-        esp_lcd_panel_reset(panel);
-        esp_lcd_panel_init(panel);
-        esp_lcd_panel_disp_on_off(panel, true);
-        esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
-        esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        // 初始化显示面板
+        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
+        ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+        ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, true));
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, 0, 40));
+        ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, true, false));
+
+        // 初始化触摸
+        const esp_lcd_touch_config_t tp_cfg = {
+            .x_max = QSPI_LCD_H_RES,
+            .y_max = QSPI_LCD_V_RES,
+            .rst_gpio_num = -1,
+            .int_gpio_num = TP_PIN_NUM_INT,
+            .flags = {
+                .swap_xy = true,
+                .mirror_x = true,
+                .mirror_y = false,
+            },
+        };
+        ESP_ERROR_CHECK(esp_lcd_touch_new_cst816s(i2c_bus_, 0x15, &tp_cfg, &tp));
 
 #if USE_LVGL_DEFAULT
-        display_ = new SpiLcdDisplay(panel_io, panel,
-        DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY, {
-            .text_font = &font_puhui_20_4,
-            .icon_font = &font_awesome_20_4,
-            .emoji_font = font_emoji_64_init(),
-        });
+        display_ = std::make_unique<LcdDisplay>(panel_io, panel, tp,
+                                               QSPI_LCD_H_RES, QSPI_LCD_V_RES,
+                                               DisplayFonts{
+                                                   .text_font = &font_puhui_20_4,
+                                                   .icon_font = &font_awesome_20_4,
+                                                   .emoji_font = font_emoji_32_init(),
+                                               });
 #else
-        display_ = new anim::EmoteDisplay(panel, panel_io);
+        display_ = std::make_unique<anim::EmoteDisplay>(panel_io, panel, tp,
+                                                      QSPI_LCD_H_RES, QSPI_LCD_V_RES);
 #endif
-        backlight_ = new PwmBacklight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
+
+        backlight_ = std::make_unique<PwmBacklight>(LCD_BACKLIGHT_GPIO);
         backlight_->RestoreBrightness();
     }
 
-    void InitializeButtons()
-    {
-        boot_button_.OnClick([this]() {
-            auto &app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ESP_LOGI(TAG, "Boot button pressed, enter WiFi configuration mode");
-                ResetWifiConfiguration();
-            }
-            app.ToggleChatState();
-        });
-        gpio_config_t power_gpio_config = {
-            .pin_bit_mask = (BIT64(POWER_CTRL)),
-            .mode = GPIO_MODE_OUTPUT,
-
-        };
-        ESP_ERROR_CHECK(gpio_config(&power_gpio_config));
-
-        gpio_set_level(POWER_CTRL, 0);
-    }
-
 public:
-    EspS3Cat() : boot_button_(BOOT_BUTTON_GPIO)
-    {
+    EspS3Cat() : boot_button_(BOOT_BUTTON_GPIO) {
         InitializeI2c();
-        uint8_t pcb_verison = DetectPcbVersion();
+        uint8_t pcb_version = DetectPcbVersion();
         InitializeCharge();
-        InitializeCst816sTouchPad();
-
         InitializeSpi();
-        Initializest77916Display(pcb_verison);
-        InitializeButtons();
+        Initializest77916Display(pcb_version);
+        InitializeCst816sTouchPad();
     }
 
-    virtual AudioCodec* GetAudioCodec() override
-    {
+    ~EspS3Cat() override {
+        // 移除中断处理
+        if (TP_PIN_NUM_INT != GPIO_NUM_NC) {
+            gpio_isr_handler_remove(TP_PIN_NUM_INT);
+        }
+        
+        // 释放I2C总线
+        if (i2c_bus_) {
+            i2c_del_master_bus(i2c_bus_);
+        }
+        if (bmi270_i2c_bus_) {
+            i2c_del_master_bus(bmi270_i2c_bus_);
+        }
+        
+        // 释放温度传感器
+        if (temp_sensor) {
+            temperature_sensor_disable(temp_sensor);
+            temperature_sensor_uninstall(temp_sensor);
+        }
+        
+        // 释放互斥锁
+        if (bmi270_mutex) {
+            vSemaphoreDelete(bmi270_mutex);
+            bmi270_mutex = nullptr;
+        }
+    }
+
+    // 实现基类接口
+    Led* GetLed() override {
+        static RgbLed led(RGB_LED_R_PIN, RGB_LED_G_PIN, RGB_LED_B_PIN);
+        return &led;
+    }
+
+    Display* GetDisplay() override {
+        return display_.get();
+    }
+
+    Backlight* GetBacklight() override {
+        return backlight_.get();
+    }
+
+    AudioCodec* GetAudioCodec() override {
         static BoxAudioCodec audio_codec(
             i2c_bus_,
+            I2C_NUM_0,
             AUDIO_INPUT_SAMPLE_RATE,
             AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_MCLK,
@@ -618,26 +892,13 @@ public:
             AUDIO_I2S_GPIO_WS,
             AUDIO_I2S_GPIO_DOUT,
             AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN,
-            AUDIO_CODEC_ES8311_ADDR,
-            AUDIO_CODEC_ES7210_ADDR,
-            AUDIO_INPUT_REFERENCE);
+            AUDIO_CODEC_GPIO_PA
+        );
         return &audio_codec;
     }
 
-    virtual Display* GetDisplay() override
-    {
-        return display_;
-    }
-
-    Cst816s* GetTouchpad()
-    {
-        return cst816s_;
-    }
-
-    virtual Backlight* GetBacklight() override
-    {
-        return backlight_;
+    Button* GetButton() override {
+        return &boot_button_;
     }
 };
 

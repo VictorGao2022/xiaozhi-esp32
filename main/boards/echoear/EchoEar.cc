@@ -403,7 +403,7 @@ static void motion_detection_task(void *arg) {
                         app.SendUserMessage("你被摔倒在地");
                         // 显示相应表情
                         if (board.GetDisplay()) {
-                            board.GetDisplay()->SetEmotion("surprised");
+                            board.GetDisplay()->SetEmotion("shocked");
                         }
                         
                         is_falling = false;
@@ -429,7 +429,7 @@ static void motion_detection_task(void *arg) {
                             app.SendUserMessage("你被狠狠地摇晃了");
                             // 显示相应表情
                             if (board.GetDisplay()) {
-                                board.GetDisplay()->SetEmotion("dizzy");
+                                board.GetDisplay()->SetEmotion("confused");
                             }
                             
                             shake_count = 0;
